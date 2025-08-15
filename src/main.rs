@@ -11,9 +11,18 @@ use std::path::Path;
 #[derive(Parser, Debug)]
 pub struct Args {
     input: String,
+
+    #[arg(default_value = "split")]
     output_dir: String,
+
+    #[arg(default_value = "BX")]
     tag: String,
+
+    #[arg(default_value = "report.tsv")]
     report_file: String,
+
+    #[arg(default_value = "_")]
+    separator: String,
 }
 
 pub fn validate_args(args: &Args) -> Result<(), Error> {
@@ -22,6 +31,31 @@ pub fn validate_args(args: &Args) -> Result<(), Error> {
         anyhow::bail!("Tag must be 2 letters!: {}", args.tag.len())
     }
     Ok(())
+}
+
+pub fn extract_umi_from_header<'a>(header: &'a str, separator: &str) -> Result<&'a str, Error> {
+    let (_rest, past_sep) = header.rsplit_once(separator).with_context(|| {
+        format!(
+            "failed to get UMI with separator '{}'. Header in question:\n{}",
+            separator, header
+        )
+    })?;
+
+    // check if we have r1/r2 extensions, e.g:
+    // <REST_OF_HEADER>_<UMI>/1
+    // if we don't remove that, we'll over-stratify read groups.
+    if let Some((umi, _mate_info)) = past_sep.rsplit_once("/") {
+        Ok(umi)
+    } else {
+        Ok(past_sep)
+    }
+}
+
+pub fn get_umi(r: &Record, separator: &str) -> Result<String, Error> {
+    unsafe {
+        let s = std::str::from_utf8_unchecked(r.qname());
+        Ok(String::from(extract_umi_from_header(s, separator)?))
+    }
 }
 
 pub fn qname_to_string(qname: &[u8]) -> String {
@@ -51,6 +85,7 @@ pub struct VarianceReport {
     ratio_diff: f32,
     total_count: usize,
     n_diff_pos: usize,
+    n_diff_umis: usize,
 }
 
 pub struct SeqMap {
@@ -74,12 +109,22 @@ impl SeqMap {
         Self { inner, count: 0 }
     }
 
+    // kind of slow right now, need to combine a lot of operations in one loop instead of using
+    // several.
     fn tally_deviants(&mut self) -> VarianceReport {
         let mut diff_positions: HashSet<usize> = HashSet::new();
+        let mut diff_umis: HashSet<String> = HashSet::new();
 
         // sort in reverse by read sequence count, so that 0th kv is highest count
         self.inner
             .sort_by(|_k1, v1, _k2, v2| v2.count.cmp(&v1.count));
+
+        // tally unique UMIs
+        self.inner.iter().for_each(|(_k, v)| {
+            v.reads.iter().for_each(|r| {
+                diff_umis.insert(get_umi(&r, "_").expect("Failed to get read UMI"));
+            })
+        });
 
         let _maj_count = self.inner.get_index(0).unwrap().1.count;
         let mut diff_count = 0;
@@ -108,11 +153,15 @@ impl SeqMap {
 
         let n_diff_pos = diff_positions.len();
 
+        // we subtract one since we always have the majority UMI
+        let n_diff_umis = diff_umis.len() - 1;
+
         VarianceReport {
             diff_count,
             total_count,
             ratio_diff,
             n_diff_pos,
+            n_diff_umis,
         }
     }
 }
@@ -154,8 +203,12 @@ pub fn write_cluster_report(
 ) -> Result<(), Error> {
     Ok(writeln!(
         writer,
-        "{tag}\t{}\t{}\t{}\t{}",
-        report.diff_count, report.n_diff_pos, report.ratio_diff, report.total_count
+        "{tag}\t{}\t{}\t{}\t{}\t{}",
+        report.diff_count,
+        report.n_diff_pos,
+        report.ratio_diff,
+        report.n_diff_umis,
+        report.total_count
     )?)
 }
 
@@ -180,7 +233,7 @@ fn main() -> Result<(), Error> {
     let report_file = create_file_timestamp(&args.report_file);
     let fhandle = std::fs::File::create_new(report_file)?;
     let mut bufwriter = BufWriter::new(fhandle);
-    bufwriter.write(b"tag\tnum_diff\tnum_unique_diff_pos\tfrac_diff\ttotal\n")?;
+    bufwriter.write(b"tag\tnum_diff\tnum_unique_diff_pos\tfrac_diff\tn_diff_umis\ttotal\n")?;
 
     let tag = args.tag.as_bytes();
     let mut cur_file_name = "".to_string();
