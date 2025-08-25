@@ -86,6 +86,7 @@ pub struct VarianceReport {
     total_count: usize,
     n_diff_pos: usize,
     n_diff_umis: usize,
+    n_reads_highest_mapq: usize,
 }
 
 pub struct SeqMap {
@@ -114,6 +115,7 @@ impl SeqMap {
     fn tally_deviants(&mut self) -> VarianceReport {
         let mut diff_positions: HashSet<usize> = HashSet::new();
         let mut diff_umis: HashSet<String> = HashSet::new();
+        let mut mapq_count: IndexMap<u8, usize> = IndexMap::new();
 
         // sort in reverse by read sequence count, so that 0th kv is highest count
         self.inner
@@ -122,7 +124,8 @@ impl SeqMap {
         // tally unique UMIs
         self.inner.iter().for_each(|(_k, v)| {
             v.reads.iter().for_each(|r| {
-                diff_umis.insert(get_umi(&r, "_").expect("Failed to get read UMI"));
+                diff_umis.insert(get_umi(r, "_").expect("Failed to get read UMI"));
+                *mapq_count.entry(r.mapq()).or_insert(0) += 1;
             })
         });
 
@@ -134,7 +137,7 @@ impl SeqMap {
             .for_each(|(_k, v)| diff_count += v.count);
 
         // let total_count = (maj_count + diff_count) as usize;
-        let total_count = self.count as usize;
+        let total_count = self.count;
         let ratio_diff = diff_count as f32 / (total_count as f32);
         let diff_count = diff_count as usize;
 
@@ -156,12 +159,17 @@ impl SeqMap {
         // we subtract one since we always have the majority UMI
         let n_diff_umis = diff_umis.len() - 1;
 
+        // sort to get the highest mapq in 0th idx
+        mapq_count.sort_by(|k1, _v1, k2, _v2| k2.cmp(k1));
+        let (_mapq, n_reads_highest_mapq) = mapq_count.swap_remove_index(0).unwrap();
+
         VarianceReport {
             diff_count,
             total_count,
             ratio_diff,
             n_diff_pos,
             n_diff_umis,
+            n_reads_highest_mapq,
         }
     }
 }
@@ -203,12 +211,13 @@ pub fn write_cluster_report(
 ) -> Result<(), Error> {
     Ok(writeln!(
         writer,
-        "{tag}\t{}\t{}\t{}\t{}\t{}",
+        "{tag}\t{}\t{}\t{}\t{}\t{}\t{}",
         report.diff_count,
         report.n_diff_pos,
         report.ratio_diff,
         report.n_diff_umis,
-        report.total_count
+        report.total_count,
+        report.n_reads_highest_mapq,
     )?)
 }
 
@@ -233,14 +242,14 @@ fn main() -> Result<(), Error> {
     let report_file = create_file_timestamp(&args.report_file);
     let fhandle = std::fs::File::create_new(report_file)?;
     let mut bufwriter = BufWriter::new(fhandle);
-    bufwriter.write(b"tag\tnum_diff\tnum_unique_diff_pos\tfrac_diff\tn_diff_umis\ttotal\n")?;
+    bufwriter.write_all(b"tag\tnum_diff\tnum_unique_diff_pos\tfrac_diff\tn_diff_umis\ttotal\tn_reads_highest_mapq\n")?;
 
     let tag = args.tag.as_bytes();
     let mut cur_file_name = "".to_string();
 
     let mut reader = Reader::from_path(&args.input)?;
     reader.set_threads(num_cpus::get())?;
-    let header = Header::from_template(&reader.header());
+    let header = Header::from_template(reader.header());
 
     let mut writer: Writer;
     let mut prev_tag = "".to_string();
