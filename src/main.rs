@@ -87,6 +87,8 @@ pub struct VarianceReport {
     n_diff_pos: usize,
     n_diff_umis: usize,
     n_reads_highest_mapq: usize,
+    most_bases_mismatch: usize,
+    least_bases_mismatch: usize,
 }
 
 pub struct SeqMap {
@@ -116,6 +118,8 @@ impl SeqMap {
         let mut diff_positions: HashSet<usize> = HashSet::new();
         let mut diff_umis: HashSet<String> = HashSet::new();
         let mut mapq_count: IndexMap<u8, usize> = IndexMap::new();
+        let mut least_bases_mismatch = usize::MAX;
+        let mut most_bases_mismatch = usize::MIN;
 
         // sort in reverse by read sequence count, so that 0th kv is highest count
         self.inner
@@ -145,13 +149,18 @@ impl SeqMap {
 
         self.inner.iter().skip(1).for_each(|(_k, v)| {
             let other_seq = v.reads[0].seq().as_bytes();
+            let mut mismatch_count: usize = 0;
 
             // note that we only check the bases up to the end of the shortest read.
             for i in 0..(std::cmp::min(maj_seq.len(), other_seq.len())) {
                 if maj_seq[i] != other_seq[i] {
                     diff_positions.insert(i);
+                    mismatch_count += 1;
                 }
             }
+
+            least_bases_mismatch = std::cmp::min(mismatch_count, least_bases_mismatch);
+            most_bases_mismatch = std::cmp::max(mismatch_count, least_bases_mismatch);
         });
 
         let n_diff_pos = diff_positions.len();
@@ -170,6 +179,8 @@ impl SeqMap {
             n_diff_pos,
             n_diff_umis,
             n_reads_highest_mapq,
+            most_bases_mismatch,
+            least_bases_mismatch,
         }
     }
 }
@@ -211,13 +222,15 @@ pub fn write_cluster_report(
 ) -> Result<(), Error> {
     Ok(writeln!(
         writer,
-        "{tag}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{tag}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         report.diff_count,
         report.n_diff_pos,
         report.ratio_diff,
         report.n_diff_umis,
         report.total_count,
         report.n_reads_highest_mapq,
+        report.least_bases_mismatch,
+        report.most_bases_mismatch,
     )?)
 }
 
@@ -242,7 +255,7 @@ fn main() -> Result<(), Error> {
     let report_file = create_file_timestamp(&args.report_file);
     let fhandle = std::fs::File::create_new(report_file)?;
     let mut bufwriter = BufWriter::new(fhandle);
-    bufwriter.write_all(b"tag\tnum_diff\tnum_unique_diff_pos\tfrac_diff\tn_diff_umis\ttotal\tn_reads_highest_mapq\n")?;
+    bufwriter.write_all(b"tag\tnum_diff\tnum_unique_diff_pos\tfrac_diff\tn_diff_umis\ttotal\tn_reads_highest_mapq\tleast_bases_mismatch\tmost_bases_mismatch\n")?;
 
     let tag = args.tag.as_bytes();
     let mut cur_file_name = "".to_string();
