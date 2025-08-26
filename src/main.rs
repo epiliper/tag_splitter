@@ -10,18 +10,19 @@ use std::path::Path;
 
 #[derive(Parser, Debug)]
 pub struct Args {
+    #[arg(short = 'i')]
     input: String,
 
-    #[arg(default_value = "split")]
+    #[arg(short = 'd', default_value = "split")]
     output_dir: String,
 
-    #[arg(default_value = "BX")]
+    #[arg(short = 't', default_value = "BX")]
     tag: String,
 
-    #[arg(default_value = "report.tsv")]
+    #[arg(short = 'o', default_value = "report.tsv")]
     report_file: String,
 
-    #[arg(default_value = "_")]
+    #[arg(short = 's', default_value = "_")]
     separator: String,
 }
 
@@ -71,6 +72,13 @@ pub fn make_writer_from_file(
     outdir: &str,
     cur_file_name: &mut String,
 ) -> Result<Writer, Error> {
+    let infile = Path::new(infile)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
     let (outname, _ext) = infile
         .rsplit_once(".bam")
         .context("Bam file extension not found.")?;
@@ -149,7 +157,11 @@ impl SeqMap {
 
         self.inner.iter().skip(1).for_each(|(_k, v)| {
             let other_seq = v.reads[0].seq().as_bytes();
-            let mut mismatch_count: usize = 0;
+
+            // if we have a read that's longer than the majority sequence, then count the number of
+            // extra bases as mismatches.
+            let mut mismatch_count: usize =
+                (maj_seq.len() as i32 - other_seq.len() as i32).abs() as usize;
 
             // note that we only check the bases up to the end of the shortest read.
             for i in 0..(std::cmp::min(maj_seq.len(), other_seq.len())) {
