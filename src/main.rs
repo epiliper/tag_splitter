@@ -160,8 +160,13 @@ impl SeqMap {
             }
 
             least_bases_mismatch = std::cmp::min(mismatch_count, least_bases_mismatch);
-            most_bases_mismatch = std::cmp::max(mismatch_count, least_bases_mismatch);
+            most_bases_mismatch = std::cmp::max(mismatch_count, most_bases_mismatch);
         });
+
+        // no mismatched reads to update mismatch counts, so revert to zero.
+        if least_bases_mismatch == usize::MAX {
+            least_bases_mismatch = 0;
+        }
 
         let n_diff_pos = diff_positions.len();
 
