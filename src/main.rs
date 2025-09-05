@@ -4,6 +4,7 @@ use clap::Parser;
 use indexmap::IndexMap;
 use rust_htslib::bam::{
     Format, Header, Read, Reader, Record, Writer, ext::BamRecordExtensions, record::Aux,
+    record::Cigar,
 };
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
@@ -29,7 +30,7 @@ pub struct Args {
 }
 
 pub fn validate_args(args: &Args) -> Result<(), Error> {
-    println! {"{:?}", args}
+    // println! {"{:?}", args}
     if args.tag.len() != 2 {
         anyhow::bail!("Tag must be 2 letters!: {}", args.tag.len())
     }
@@ -122,6 +123,18 @@ impl SeqMap {
         Self { inner, count: 0 }
     }
 
+    fn contains_indels(&self) -> bool {
+        for (_, seq) in self.inner.iter() {
+            for r in seq.reads.iter() {
+                if read_has_indel(r) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     // kind of slow right now, need to combine a lot of operations in one loop instead of using
     // several.
     fn tally_deviants(&mut self) -> VarianceReport {
@@ -210,6 +223,16 @@ pub struct SeqEntry {
     pub qual_sum: u32,
 }
 
+pub fn read_has_indel(r: &Record) -> bool {
+    for c in r.cigar().iter() {
+        if matches!(c, Cigar::Ins(_)) || matches!(c, Cigar::Del(_)) {
+            return true;
+        }
+    }
+
+    false
+}
+
 impl SeqEntry {
     pub fn up_group(&mut self, read: Record) {
         self.reads.push(read);
@@ -288,6 +311,9 @@ fn _main() -> Result<(), Error> {
 
     let mut read_store = SeqMap::new();
 
+    let mut n_clusters_used = 0;
+    let mut n_clusters_with_indels = 0;
+
     for r in reader
         .records()
         .map(|rec| rec.expect("Failed to read read!"))
@@ -299,21 +325,27 @@ fn _main() -> Result<(), Error> {
                     // sorted file
                     if cur_tag != prev_tag {
                         if read_store.count >= 1 && prev_tag != "" {
-                            let report = read_store.tally_deviants();
-                            write_cluster_report(&mut bufwriter, &prev_tag, report)?;
+                            // don't use clusters with indels in filtering.
+                            if read_store.contains_indels() {
+                                n_clusters_with_indels += 1;
+                            } else {
+                                n_clusters_used += 1;
+                                let report = read_store.tally_deviants();
+                                write_cluster_report(&mut bufwriter, &prev_tag, report)?;
 
-                            if read_store.count >= 100 {
-                                writer = make_writer_from_file(
-                                    &args.input,
-                                    &prev_tag,
-                                    &header,
-                                    &args.output_dir,
-                                    &mut cur_file_name,
-                                )?;
+                                if read_store.count >= 100 {
+                                    writer = make_writer_from_file(
+                                        &args.input,
+                                        &prev_tag,
+                                        &header,
+                                        &args.output_dir,
+                                        &mut cur_file_name,
+                                    )?;
 
-                                for (_k, v) in read_store.inner.drain(..) {
-                                    for r in v.reads {
-                                        writer.write(&r)?;
+                                    for (_k, v) in read_store.inner.drain(..) {
+                                        for r in v.reads {
+                                            writer.write(&r)?;
+                                        }
                                     }
                                 }
                             }
@@ -321,7 +353,7 @@ fn _main() -> Result<(), Error> {
 
                         read_store.inner.clear();
                         read_store.count = 0;
-                        println! {"{cur_file_name}"}
+                        // println! {"{cur_file_name}"}
 
                         assert!(read_store.inner.is_empty());
 
@@ -347,14 +379,21 @@ fn _main() -> Result<(), Error> {
         &mut cur_file_name,
     )?;
 
-    println! {"last group..."}
-    let report = read_store.tally_deviants();
-    write_cluster_report(&mut bufwriter, &prev_tag, report)?;
-    for (_k, v) in read_store.inner.drain(..) {
-        for r in v.reads {
-            writer.write(&r)?;
+    // println! {"last group..."}
+    if read_store.contains_indels() {
+        n_clusters_with_indels += 1;
+    } else {
+        n_clusters_used += 1;
+        let report = read_store.tally_deviants();
+        write_cluster_report(&mut bufwriter, &prev_tag, report)?;
+        for (_k, v) in read_store.inner.drain(..) {
+            for r in v.reads {
+                writer.write(&r)?;
+            }
         }
     }
+
+    println! {"FILE: {}\t CLUSTERS DQed: {n_clusters_with_indels}\t CLUSTERS USED: {n_clusters_used}", args.input};
 
     Ok(())
 }
