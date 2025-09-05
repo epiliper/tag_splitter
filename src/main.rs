@@ -2,7 +2,9 @@ use anyhow::{Context, Error};
 use chrono::Local;
 use clap::Parser;
 use indexmap::IndexMap;
-use rust_htslib::bam::{Format, Header, Read, Reader, Record, Writer, record::Aux};
+use rust_htslib::bam::{
+    Format, Header, Read, Reader, Record, Writer, ext::BamRecordExtensions, record::Aux,
+};
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 use std::io::{BufWriter, Write};
@@ -252,7 +254,7 @@ pub fn write_cluster_report(
 }
 
 /// This assumes an input bam that is sorted by the same tag as used in the runtime args
-fn main() -> Result<(), Error> {
+fn _main() -> Result<(), Error> {
     let args = Args::parse();
     validate_args(&args)?;
 
@@ -296,7 +298,7 @@ fn main() -> Result<(), Error> {
                     // new tag doesn't match old one, so we've encountered a new tag group in our
                     // sorted file
                     if cur_tag != prev_tag {
-                        if read_store.count >= 3 && prev_tag != "" {
+                        if read_store.count >= 1 && prev_tag != "" {
                             let report = read_store.tally_deviants();
                             write_cluster_report(&mut bufwriter, &prev_tag, report)?;
 
@@ -355,4 +357,8 @@ fn main() -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+pub fn main() {
+    _main().map_err(|e| eprintln! {"FAIL: {e}"}).unwrap();
 }
