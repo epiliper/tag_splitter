@@ -37,6 +37,73 @@ pub fn validate_args(args: &Args) -> Result<(), Error> {
     Ok(())
 }
 
+/// Record the number of differences between two read sequences. We start comparison at the latest start coordinate, and walk along both reads until one of them runs out of bases.
+///
+/// It should be noted that soft- and hard-clipped bases are not compared, and that bases outside the span of the shortest read's mapping coordinates are not compared.
+pub fn compare_read_sequences(r1: &Record, r2: &Record) -> usize {
+    let mut num_diff = 0;
+
+    let start_pos = std::cmp::max(r1.pos(), r2.pos());
+
+    let mut iter1 = r1.aligned_pairs().map(|s| (s[0], s[1])).peekable();
+    let mut iter2 = r2.aligned_pairs().map(|s| (s[0], s[1])).peekable();
+
+    // catch up both iterators to the start position
+    while let Some((_read_pos, ref_pos)) = iter1.peek() {
+        if *ref_pos < start_pos {
+            iter1.next();
+        } else {
+            break;
+        }
+    }
+
+    while let Some((_read_pos, ref_pos)) = iter2.peek() {
+        if *ref_pos < start_pos {
+            iter2.next();
+        } else {
+            break;
+        }
+    }
+
+    loop {
+        match (iter1.peek(), iter2.peek()) {
+            (None, _) => break, // either iterator is exhausted, so break
+            (_, None) => break,
+
+            // compare both
+            (Some(&(read_a, ref_a)), Some(&(read_b, ref_b))) => {
+                // we went out of sync, catch up and register the lag as mismatches
+                if ref_a < ref_b {
+                    num_diff += 1;
+                    iter1.next();
+                    continue;
+                }
+
+                if ref_b < ref_a {
+                    num_diff += 1;
+                    iter2.next();
+                    continue;
+                }
+
+                // we are at the current position
+                assert_eq!(
+                    ref_a, ref_b,
+                    "read positions out of sync in overlap detection"
+                );
+
+                if r1.seq()[read_a as usize] != r2.seq()[read_b as usize] {
+                    num_diff += 1;
+                }
+
+                iter1.next();
+                iter2.next();
+            }
+        }
+    }
+
+    num_diff
+}
+
 pub fn extract_umi_from_header<'a>(header: &'a str, separator: &str) -> Result<&'a str, Error> {
     let (_rest, past_sep) = header.rsplit_once(separator).with_context(|| {
         format!(
@@ -168,23 +235,26 @@ impl SeqMap {
         let ratio_diff = diff_count as f32 / (total_count as f32);
         let diff_count = diff_count as usize;
 
-        let maj_seq = self.inner.get_index(0).unwrap().1.reads[0].seq().as_bytes();
+        // let maj_seq = self.inner.get_index(0).unwrap().1.reads[0].seq().as_bytes();
+        let maj_seq = &self.inner.get_index(0).unwrap().1.reads[0];
 
         self.inner.iter().skip(1).for_each(|(_k, v)| {
-            let other_seq = v.reads[0].seq().as_bytes();
+            let other_seq = &v.reads[0];
+
+            let mismatch_count = compare_read_sequences(maj_seq, other_seq);
 
             // if we have a read that's longer than the majority sequence, then count the number of
             // extra bases as mismatches.
-            let mut mismatch_count: usize =
-                (maj_seq.len() as i32 - other_seq.len() as i32).abs() as usize;
+            // let mut mismatch_count: usize =
+            //     (maj_seq.len() as i32 - other_seq.len() as i32).abs() as usize;
 
-            // note that we only check the bases up to the end of the shortest read.
-            for i in 0..(std::cmp::min(maj_seq.len(), other_seq.len())) {
-                if maj_seq[i] != other_seq[i] {
-                    diff_positions.insert(i);
-                    mismatch_count += 1;
-                }
-            }
+            // // note that we only check the bases up to the end of the shortest read.
+            // for i in 0..(std::cmp::min(maj_seq.len(), other_seq.len())) {
+            //     if maj_seq[i] != other_seq[i] {
+            //         diff_positions.insert(i);
+            //         mismatch_count += 1;
+            //     }
+            // }
 
             least_bases_mismatch = std::cmp::min(mismatch_count, least_bases_mismatch);
             most_bases_mismatch = std::cmp::max(mismatch_count, most_bases_mismatch);
@@ -326,30 +396,30 @@ fn _main() -> Result<(), Error> {
                     if cur_tag != prev_tag {
                         if read_store.count >= 1 && prev_tag != "" {
                             // don't use clusters with indels in filtering.
-                            if read_store.contains_indels() {
-                                n_clusters_with_indels += 1;
-                            } else {
-                                n_clusters_used += 1;
-                                let report = read_store.tally_deviants();
-                                write_cluster_report(&mut bufwriter, &prev_tag, report)?;
+                            // if read_store.contains_indels() {
+                            // n_clusters_with_indels += 1;
+                            // } else {
+                            n_clusters_used += 1;
+                            let report = read_store.tally_deviants();
+                            write_cluster_report(&mut bufwriter, &prev_tag, report)?;
 
-                                if read_store.count >= 100 {
-                                    writer = make_writer_from_file(
-                                        &args.input,
-                                        &prev_tag,
-                                        &header,
-                                        &args.output_dir,
-                                        &mut cur_file_name,
-                                    )?;
+                            if read_store.count >= 1000 {
+                                writer = make_writer_from_file(
+                                    &args.input,
+                                    &prev_tag,
+                                    &header,
+                                    &args.output_dir,
+                                    &mut cur_file_name,
+                                )?;
 
-                                    for (_k, v) in read_store.inner.drain(..) {
-                                        for r in v.reads {
-                                            writer.write(&r)?;
-                                        }
+                                for (_k, v) in read_store.inner.drain(..) {
+                                    for r in v.reads {
+                                        writer.write(&r)?;
                                     }
                                 }
                             }
                         }
+                        // }
 
                         read_store.inner.clear();
                         read_store.count = 0;
@@ -380,18 +450,18 @@ fn _main() -> Result<(), Error> {
     )?;
 
     // println! {"last group..."}
-    if read_store.contains_indels() {
-        n_clusters_with_indels += 1;
-    } else {
-        n_clusters_used += 1;
-        let report = read_store.tally_deviants();
-        write_cluster_report(&mut bufwriter, &prev_tag, report)?;
-        for (_k, v) in read_store.inner.drain(..) {
-            for r in v.reads {
-                writer.write(&r)?;
-            }
+    // if read_store.contains_indels() {
+    // n_clusters_with_indels += 1;
+    // } else {
+    n_clusters_used += 1;
+    let report = read_store.tally_deviants();
+    write_cluster_report(&mut bufwriter, &prev_tag, report)?;
+    for (_k, v) in read_store.inner.drain(..) {
+        for r in v.reads {
+            writer.write(&r)?;
         }
     }
+    // }
 
     println! {"FILE: {}\t CLUSTERS DQed: {n_clusters_with_indels}\t CLUSTERS USED: {n_clusters_used}", args.input};
 
