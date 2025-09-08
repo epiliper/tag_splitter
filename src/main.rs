@@ -129,6 +129,10 @@ pub fn get_umi(r: &Record, separator: &str) -> Result<String, Error> {
     }
 }
 
+pub fn phred_sum(r: &Record) -> u32 {
+    r.qual().iter().map(|&b| b as u32).sum()
+}
+
 pub fn qname_to_string(qname: &[u8]) -> String {
     unsafe { String::from_utf8_unchecked(qname.to_vec()) }
 }
@@ -162,12 +166,15 @@ pub struct VarianceReport {
     diff_count: usize,
     ratio_diff: f32,
     total_count: usize,
-    n_diff_pos: usize,
+    // n_diff_pos: usize,
     n_diff_umis: usize,
     n_reads_highest_mapq: usize,
     most_bases_mismatch: usize,
     least_bases_mismatch: usize,
+    winning_read_has_highest_mapq_umi: bool,
 }
+
+pub type MapqMetrics = IndexMap<u8, (HashSet<String>, HashSet<Vec<u8>>)>;
 
 pub struct SeqMap {
     inner: IndexMap<u64, SeqEntry>,
@@ -205,21 +212,34 @@ impl SeqMap {
     // kind of slow right now, need to combine a lot of operations in one loop instead of using
     // several.
     fn tally_deviants(&mut self) -> VarianceReport {
-        let mut diff_positions: HashSet<usize> = HashSet::new();
-        let mut diff_umis: HashSet<String> = HashSet::new();
-        let mut mapq_count: IndexMap<u8, usize> = IndexMap::new();
+        // let mut diff_positions: HashSet<usize> = HashSet::new();
         let mut least_bases_mismatch = usize::MAX;
         let mut most_bases_mismatch = usize::MIN;
+
+        let mut mapq_map = MapqMetrics::new();
 
         // sort in reverse by read sequence count, so that 0th kv is highest count
         self.inner
             .sort_by(|_k1, v1, _k2, v2| v2.count.cmp(&v1.count));
 
+        // identify rumina-winning read
+        let mut temp = self.inner[0].reads.clone();
+        temp.sort_by(|a, b| phred_sum(b).cmp(&phred_sum(a)));
+
+        let rumina_winning_read = temp.swap_remove(0);
+
         // tally unique UMIs
         self.inner.iter().for_each(|(_k, v)| {
             v.reads.iter().for_each(|r| {
-                diff_umis.insert(get_umi(r, "_").expect("Failed to get read UMI"));
-                *mapq_count.entry(r.mapq()).or_insert(0) += 1;
+                let (e_umi, e_id) = mapq_map
+                    .entry(r.mapq())
+                    .or_insert((HashSet::new(), HashSet::new()));
+
+                e_umi.insert(get_umi(r, "_").expect("failed to get read read UMI"));
+                e_id.insert(r.qname().to_vec());
+
+                // diff_umis.insert(get_umi(r, "_").expect("Failed to get read UMI"));
+                // *mapq_count.entry(r.mapq()).or_insert(0) += 1;
             })
         });
 
@@ -265,24 +285,46 @@ impl SeqMap {
             least_bases_mismatch = 0;
         }
 
-        let n_diff_pos = diff_positions.len();
+        // let n_diff_pos = diff_positions.len();
+
+        // prepare variables for mapq-oriented analysis
+        let mut highest_mapq = u8::MIN;
+        let mut n_reads_highest_mapq = 0;
+        let mut highest_mapq_umis: HashSet<String> = HashSet::new();
+
+        for (&mapq, (umi, id)) in mapq_map.iter() {
+            if mapq > highest_mapq {
+                highest_mapq = mapq;
+                n_reads_highest_mapq = id.len();
+                highest_mapq_umis = umi.clone();
+            }
+        }
 
         // we subtract one since we always have the majority UMI
-        let n_diff_umis = diff_umis.len() - 1;
+        let mut diff_umi: HashSet<&String> = HashSet::new();
+        mapq_map
+            .iter()
+            .for_each(|(_mapq, (umi, _read))| diff_umi.extend(umi));
+
+        let n_diff_umis = diff_umi.len() - 1;
+
+        let winning_read_has_highest_mapq_umi =
+            highest_mapq_umis.contains(&get_umi(&rumina_winning_read, "_").unwrap());
 
         // sort to get the highest mapq in 0th idx
-        mapq_count.sort_by(|k1, _v1, k2, _v2| k2.cmp(k1));
-        let (_mapq, n_reads_highest_mapq) = mapq_count.swap_remove_index(0).unwrap();
+        // mapq_count.sort_by(|k1, _v1, k2, _v2| k2.cmp(k1));
+        // let (_mapq, n_reads_highest_mapq) = mapq_count.swap_remove_index(0).unwrap();
 
         VarianceReport {
             diff_count,
             total_count,
             ratio_diff,
-            n_diff_pos,
+            // n_diff_pos,
             n_diff_umis,
             n_reads_highest_mapq,
             most_bases_mismatch,
             least_bases_mismatch,
+            winning_read_has_highest_mapq_umi,
         }
     }
 }
@@ -336,13 +378,14 @@ pub fn write_cluster_report(
         writer,
         "{tag}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         report.diff_count,
-        report.n_diff_pos,
+        // report.n_diff_pos,
         report.ratio_diff,
         report.n_diff_umis,
         report.total_count,
         report.n_reads_highest_mapq,
         report.least_bases_mismatch,
         report.most_bases_mismatch,
+        report.winning_read_has_highest_mapq_umi,
     )?)
 }
 
@@ -367,7 +410,7 @@ fn _main() -> Result<(), Error> {
     let report_file = create_file_timestamp(&args.report_file);
     let fhandle = std::fs::File::create_new(report_file)?;
     let mut bufwriter = BufWriter::new(fhandle);
-    bufwriter.write_all(b"tag\tnum_diff\tnum_unique_diff_pos\tfrac_diff\tn_diff_umis\ttotal\tn_reads_highest_mapq\tleast_bases_mismatch\tmost_bases_mismatch\n")?;
+    bufwriter.write_all(b"tag\tnum_diff\tfrac_diff\tn_diff_umis\ttotal\tn_reads_highest_mapq\tleast_bases_mismatch\tmost_bases_mismatch\twinning_read_has_highest_mapq_umi\n")?;
 
     let tag = args.tag.as_bytes();
     let mut cur_file_name = "".to_string();
